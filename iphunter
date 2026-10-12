@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+iphunter - hunt down valid IPv4 / IPv6 addresses in arbitrary text.
+
+Reads text on stdin (log files, `strings` output, config dumps, packet traces,
+anything human readable), extracts candidate addresses that are *not*
+necessarily delimited by word boundaries, validates every candidate with the
+Python standard library `ipaddress` module, and prints one address per line.
+
+    cat /var/log/auth.log | iphunter -all -routable
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import io
+import os
+import re
+import sys
+
+# --------------------------------------------------------------------------- #
+# Version / identity
+# --------------------------------------------------------------------------- #
+
+VERSION = "26.09.2"
+
+PROG = os.path.basename(sys.argv[0] or "") or "iphunter"
+if PROG.endswith(".py"):
+    PROG = PROG[:-3]
+
+# --------------------------------------------------------------------------- #
+# Bogon / non-routable tables
+#
+# `ipaddress` flags (is_private, is_loopback, is_reserved, ...) shift slightly
+# between Python releases, so the ranges below are spelled out explicitly and
+# are the authoritative answer for -routable / -private.  Edit to taste.
+# --------------------------------------------------------------------------- #
+
+_BOGONS_V4 = (
+    "0.0.0.0/8",           # "this" network
+    "10.0.0.0/8",          # RFC1918
+    "100.64.0.0/10",       # RFC6598 carrier grade NAT
+    "127.0.0.0/8",         # loopback
+    "169.254.0.0/16",      # RFC3927 link local
+    "172.16.0.0/12",       # RFC1918
+    "192.0.0.0/24",        # IETF protocol assignments
+    "192.0.2.0/24",        # TEST-NET-1
+    "192.88.99.0/24",      # deprecated 6to4 relay anycast
+    "192.168.0.0/16",      # RFC1918
+    "198.18.0.0/15",       # RFC2544 benchmarking
+    "198.51.100.0/24",     # TEST-NET-2
+    "203.0.113.0/24",      # TEST-NET-3
+    "224.0.0.0/4",         # multicast
+    "240.0.0.0/4",         # reserved + 255.255.255.255
+)
+
+_BOGONS_V6 = (
+    "::/128",              # unspecified
+    "::1/128",             # loopback
+    "::/96",               # deprecated IPv4-compatible
+    "::ffff:0:0/96",       # IPv4-mapped
+    "64:ff9b:1::/48",      # local-use NAT64
+    "100::/64",            # discard-only
+    "2001:2::/48",         # benchmarking
+    "2001:10::/28",        # deprecated ORCHID
+    "2001:20::/28",        # ORCHIDv2
+    "2001:db8::/32",       # documentation
+    "2002::/16",           # deprecated 6to4
+    "3fff::/20",           # RFC9637 documentation
+    "5f00::/16",           # RFC9602 SRv6 SIDs
+    "fc00::/7",            # unique local
+    "fe80::/10",           # link local
+    "fec0::/10",           # deprecated site local
+    "ff00::/8",            # multicast
+)
+
+# Private / local-use space.  This is a strict subset of the bogon tables above:
+# every range here is also non-routable.  Loopback and link local live here
+# rather than with the bogons because in a log they describe local
+# infrastructure, not an oddity.
+_PRIVATE_V4 = (
+    "10.0.0.0/8",          # RFC1918
+    "127.0.0.0/8",         # loopback
+    "169.254.0.0/16",      # RFC3927 link local
+    "172.16.0.0/12",       # RFC1918
+    "192.168.0.0/16",      # RFC1918
+)
+
+_PRIVATE_V6 = (
+    "::1/128",             # loopback
+    "fc00::/7",            # unique local
+    "fe80::/10",           # link local
+    "fec0::/10",           # deprecated site local
+)
+
+_NON_ROUTABLE = {
+    4: tuple(ipaddress.ip_network(n) for n in _BOGONS_V4),
+    6: tuple(ipaddress.ip_network(n) for n in _BOGONS_V6),
+}
+
+_PRIVATE = {
+    4: tuple(ipaddress.ip_network(n) for n in _PRIVATE_V4),
+    6: tuple(ipaddress.ip_network(n) for n in _PRIVATE_V6),
+}
+
+# --------------------------------------------------------------------------- #
+# Candidate extraction
+#
+# The regex only has to find plausible candidates; `ipaddress` decides what is
+# actually valid.  999.123.4.765 will match below and then be thrown away.
+#
+# Boundaries are deliberately *not* \b:
+#   IPv4 - rejected only when glued to another digit, or to "<digit>."
+#   IPv6 - rejected only when glued to a hex digit, another letter, or a colon
+# so 192.168.1.1:8080 , [2001:db8::1]:443 , src=10.0.0.1, and ip=::1; all work.
+# --------------------------------------------------------------------------- #
+
+_H = r"[0-9A-Fa-f]{1,4}"                    # one hextet
+_Q = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"       # permissive dotted quad
+
+_V6_FORMS = (
+    # Forms with a trailing dotted quad must be tried first, otherwise
+    # "::ffff:192.168.1.1" gets clipped to "::ffff:192".
+    r"(?:%(H)s:){6}%(Q)s",                        # 0:0:0:0:0:ffff:1.2.3.4
+    r"(?:%(H)s:){1,5}(?::%(H)s){1,4}:%(Q)s",      # 1:2::3:1.2.3.4
+    r"(?:%(H)s:){1,5}:%(Q)s",                     # 64:ff9b::1.2.3.4
+    r"::(?:%(H)s:){0,5}%(Q)s",                    # ::1.2.3.4 / ::ffff:1.2.3.4
+    # Plain hextet forms, longest first.
+    r"(?:%(H)s:){7}%(H)s",                        # 1:2:3:4:5:6:7:8
+    r"(?:%(H)s:){1,7}:",                          # 1:: ... 1:2:3:4:5:6:7::
+    r"(?:%(H)s:){1,6}:%(H)s",                     # 1::8
+    r"(?:%(H)s:){1,5}(?::%(H)s){1,2}",            # 1::7:8
+    r"(?:%(H)s:){1,4}(?::%(H)s){1,3}",
+    r"(?:%(H)s:){1,3}(?::%(H)s){1,4}",
+    r"(?:%(H)s:){1,2}(?::%(H)s){1,5}",
+    r"%(H)s:(?::%(H)s){1,6}",                     # 1::3:4:5:6:7:8
+    r":(?::%(H)s){1,7}",                          # ::8
+    r"::",                                        # unspecified
+)
+
+_V6_BODY = "|".join(f % {"H": _H, "Q": _Q} for f in _V6_FORMS)
+
+_V6_PATTERN = (
+    r"(?<![0-9A-Za-z:])"                # left boundary
+    r"(?:" + _V6_BODY + r")"
+    r"(?:%[0-9A-Za-z][0-9A-Za-z._~-]*)?"  # optional zone / scope id
+    r"(?![0-9A-Za-z:])"                 # right boundary
+)
+
+_V4_PATTERN = (
+    r"(?<![0-9])(?<![0-9]\.)"           # not glued to a digit or "<digit>."
+    r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+    r"(?!\.?[0-9])"                     # not glued to a digit or ".<digit>"
+)
+
+# IPv6 first so that embedded IPv4 (::ffff:1.2.3.4) is consumed as one address.
+IP_RE = re.compile("(?P<v6>" + _V6_PATTERN + ")|(?P<v4>" + _V4_PATTERN + ")")
+
+# --------------------------------------------------------------------------- #
+# Color
+# --------------------------------------------------------------------------- #
+
+RESET = "\033[0m"
+COLOR_V4 = "\033[36m"   # cyan
+COLOR_V6 = "\033[32m"   # green
+
+
+def want_color(mode: str) -> bool:
+    """TTY aware color decision.  Piped or redirected output stays clean."""
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Validation helpers
+# --------------------------------------------------------------------------- #
+
+def depad(text):
+    """
+    Remove leading zeros from the octets of a dotted quad, in place.
+
+    Handles a bare IPv4 address and the trailing quad of an IPv4-embedded IPv6
+    address.  Returns None when there was no zero padding to remove, so the
+    caller can tell "not padded" apart from "padded and still invalid".
+    """
+    head, sep, tail = text.rpartition(":")
+    if "." not in tail:
+        return None
+    octets = tail.split(".")
+    if len(octets) != 4:
+        return None
+    if not any(len(o) > 1 and o[0] == "0" for o in octets):
+        return None
+    return head + sep + ".".join(o.lstrip("0") or "0" for o in octets)
+
+
+def validate(text, lax=False):
+    """
+    Hand the candidate to `ipaddress`.
+
+    Returns (address_object, evidence_text, was_padded).
+
+    The text returned is what was literally present in the input, never a
+    rewritten form: validation may strip zero padding to decide whether a
+    candidate is an address, but the caller still reports the original bytes.
+    Use -n when you want the canonical form instead.
+
+    Falls back to stripping a %zone suffix for interpreters that predate
+    scoped-address support.
+    """
+    try:
+        return ipaddress.ip_address(text), text, False
+    except ValueError:
+        pass
+
+    if "%" in text:
+        base = text.split("%", 1)[0]
+        try:
+            return ipaddress.ip_address(base), base, False
+        except ValueError:
+            pass
+
+    # Leading zeros are ambiguous: inet_aton and friends read 016 as octal,
+    # a human reads it as 16, and CVE-2021-29921 is what happens when two
+    # parsers disagree.  `ipaddress` refuses them outright, so decide here.
+    stripped = depad(text)
+    if stripped is not None:
+        try:
+            ip = ipaddress.ip_address(stripped)
+        except ValueError:
+            return None, None, False
+        if lax:
+            return ip, text, True
+        return None, None, True   # valid once de-padded, but suppressed
+
+    return None, None, False
+
+
+def classify(ip) -> str:
+    """
+    Sort an address into exactly one of three buckets.
+
+      private  - RFC1918, ULA, loopback, link local: local infrastructure
+      routable - reachable on the public internet
+      bogon    - non-routable and not local: documentation, TEST-NET, CGNAT,
+                 multicast, broadcast, IPv4-mapped, 6to4, reserved, unspecified
+
+    The three are a complete partition, so -routable -private -bogon is
+    equivalent to applying no scope filter at all.
+    """
+    if any(ip in net for net in _PRIVATE[ip.version]):
+        return "private"
+    if (ip.is_unspecified or ip.is_multicast or ip.is_reserved
+            or ip.is_private or ip.is_loopback or ip.is_link_local):
+        return "bogon"
+    if any(ip in net for net in _NON_ROUTABLE[ip.version]):
+        return "bogon"
+    return "routable"
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+EPILOG = """\
+examples:
+  cat auth.log | {p}                          valid IPv4 only (default)
+  {p} -v6 < traffic.txt                       valid IPv6 only
+  strings core.dump | {p} -all -routable      both families, public only
+  journalctl -u sshd | {p} -v4 -private -u    unique internal IPv4 hits
+  {p} -v4 -private -bogon < mixed.log         everything not on the internet
+  {p} -all < mixed.log > addresses.txt        color is dropped when redirected
+
+scope filters:
+  -routable, -private and -bogon stack; each one adds a bucket to the output.
+  Supplying none of them is the same as supplying all three.  The buckets are a
+  complete partition, so counts always add up:
+
+    private   RFC1918, unique local, loopback, link local
+    routable  reachable on the public internet
+    bogon     everything else that is not routable, e.g. documentation ranges,
+              TEST-NET, CGNAT, multicast, broadcast, IPv4-mapped, 6to4,
+              reserved and unspecified
+
+  IPv4-mapped IPv6 (::ffff:10.0.0.1) is classed as a bogon on the grounds that
+  the address as written is not usable on either network.
+
+evidence fidelity:
+  Without -n the line printed is byte for byte what was found in the input.
+  Validation may de-pad or de-scope a candidate internally to decide whether it
+  is an address, but that working copy is never what gets reported.  So under
+  --lax, 104.016.132.229 validates via 104.16.132.229 and prints as
+  104.016.132.229.  Pass -n when you want the canonical form instead.
+
+  Zero-padded candidates that are valid once de-padded are counted and reported
+  on stderr when --lax is absent, so a padded log never fails silently.  Note
+  that a padded octet has a second reading: to inet_aton, 016 is octal 14, not
+  16.  iphunter reports the decimal reading and leaves that call to you.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Find and validate IPv4/IPv6 addresses in text read from stdin.",
+        epilog=EPILOG.format(p=PROG),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version="%s %s" % (PROG, VERSION),
+        help="show the script name and version, then exit",
+    )
+
+    family = parser.add_mutually_exclusive_group()
+    family.add_argument(
+        "-v4", dest="family", action="store_const", const="v4",
+        help="print only valid IPv4 addresses (default)",
+    )
+    family.add_argument(
+        "-v6", dest="family", action="store_const", const="v6",
+        help="print only valid IPv6 addresses",
+    )
+    family.add_argument(
+        "-all", dest="family", action="store_const", const="all",
+        help="print valid IPv4 and IPv6 addresses",
+    )
+
+    # Scope filters stack.  Giving none of them means "no scope filter".
+    parser.add_argument(
+        "-routable", action="store_true",
+        help="include addresses routable on the public internet",
+    )
+    parser.add_argument(
+        "-private", action="store_true",
+        help="include RFC1918, ULA, loopback and link local addresses",
+    )
+    parser.add_argument(
+        "-bogon", action="store_true",
+        help="include other non-routable addresses (documentation, TEST-NET, "
+             "CGNAT, multicast, broadcast, IPv4-mapped, reserved)",
+    )
+
+    parser.add_argument(
+        "-l", "--lax", action="store_true",
+        help="accept zero-padded IPv4 octets (104.016.132.229) by validating "
+             "the de-padded form; output still shows the original text",
+    )
+    parser.add_argument(
+        "-u", "--unique", action="store_true",
+        help="suppress repeats, keeping first-seen order",
+    )
+    parser.add_argument(
+        "-n", "--normalize", action="store_true",
+        help="print the canonical form instead of the text as found",
+    )
+    parser.add_argument(
+        "--color", choices=("auto", "always", "never"), default="auto",
+        help="colorize output (default: auto, i.e. only when stdout is a tty)",
+    )
+
+    parser.set_defaults(family="v4")
+    return parser
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    colored = want_color(args.color)
+    want_v4 = args.family in ("v4", "all")
+    want_v6 = args.family in ("v6", "all")
+
+    # An empty set means every scope, so the flags are purely additive.
+    scopes = {name for name in ("routable", "private", "bogon")
+              if getattr(args, name)}
+
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
+    if sys.stdin.isatty():
+        sys.stderr.write(
+            "%s: reading from the terminal, end input with Ctrl-D "
+            "(usage: cat logfile | %s)\n" % (PROG, PROG)
+        )
+
+    # errors="replace" so binary junk from `strings`/core dumps cannot kill us.
+    stream = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+
+    seen = set()
+    suppressed = 0
+    write = sys.stdout.write
+
+    for line in stream:
+        for match in IP_RE.finditer(line):
+            ip, text, padded = validate(match.group(0), args.lax)
+            if ip is None:
+                if padded:
+                    suppressed += 1
+                continue
+
+            if ip.version == 4 and not want_v4:
+                continue
+            if ip.version == 6 and not want_v6:
+                continue
+
+            if scopes and classify(ip) not in scopes:
+                continue
+
+            out = str(ip) if args.normalize else text
+
+            if args.unique:
+                if out in seen:
+                    continue
+                seen.add(out)
+
+            if colored:
+                write((COLOR_V4 if ip.version == 4 else COLOR_V6) + out + RESET + "\n")
+            else:
+                write(out + "\n")
+
+    # Never drop evidence silently.  stderr keeps stdout clean for redirection.
+    if suppressed:
+        sys.stderr.write(
+            "%s: %d zero-padded IPv4 candidate%s rejected as ambiguous "
+            "(leading zeros are octal to some parsers); re-run with --lax "
+            "to include them\n" % (PROG, suppressed, "" if suppressed == 1 else "s")
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # e.g. `iphunter | head` - swallow the noise on exit.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)

@@ -1,0 +1,14 @@
+[project]
+name = "iphunter"
+version = "26.09.2"
+description = "Find and validate IPv4/IPv6 addresses in arbitrary text on stdin"
+readme = "README.md"
+requires-python = ">=3.9"
+
+# iphunter is pure standard library: argparse + ipaddress + re + io + os + sys.
+# Nothing to install. `uv sync` simply builds you a clean interpreter to run it
+# against, which keeps the shebang honest if you ever add dependencies.
+dependencies = []
+
+[tool.uv]
+package = false
